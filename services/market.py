@@ -525,63 +525,61 @@ class MarketService:
     # BINANCE WORKER
     # ========================================================
 
-    def _websocket_worker(
-        self
-    ):
+    def _websocket_worker(self):
 
-        while self.running:
+    while self.running:
 
-            try:
+        try:
 
-                self.ws = (
-                    websocket.WebSocketApp(
+            print(
+                "Connecting to Binance WebSocket:",
+                BINANCE_WS_URL,
+                flush=True
+            )
 
-                        BINANCE_WS_URL,
+            self.ws = websocket.WebSocketApp(
 
-                        on_open=
-                            self._on_open,
+                BINANCE_WS_URL,
 
-                        on_message=
-                            self._on_message,
+                on_open=self._on_open,
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close
 
-                        on_error=
-                            self._on_error,
+            )
 
-                        on_close=
-                            self._on_close
+            print(
+                "Calling WebSocket run_forever()...",
+                flush=True
+            )
 
-                    )
-                )
+            self.ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10
+            )
 
+            print(
+                "WebSocket run_forever() returned.",
+                flush=True
+            )
 
-                self.ws.run_forever(
+        except Exception as error:
 
-                    ping_interval=20,
-
-                    ping_timeout=10
-
-                )
-
-
-            except Exception as error:
-
-                print(
-                    "Market WebSocket worker error:",
-                    error
-                )
-
-
-            self.connected = False
+            print(
+                "WebSocket worker exception:",
+                repr(error),
+                flush=True
+            )
 
 
-            if self.running:
+        if self.running:
 
-                print(
-                    "Reconnecting Binance "
-                    "in 3 seconds..."
-                )
+            print(
+                "Reconnecting Binance in 3 seconds...",
+                flush=True
+            )
 
-                time.sleep(3)
+            time.sleep(3)
 
 
     # ========================================================
