@@ -1,5 +1,8 @@
 Flask
+gunicorn
 flask-sock
+simple-websocket
 requests
 websocket-client
 psycopg[binary]
+python-dotenv
