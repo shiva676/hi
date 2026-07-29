@@ -6,7 +6,7 @@ from flask import (
 )
 
 from flask_sock import Sock
-from database.db import init_database
+
 from config import (
     DEBUG,
     HOST,
@@ -25,7 +25,6 @@ from routes.websocket import (
 )
 
 from services.market import market
-
 from services.trading import trading
 
 
@@ -37,21 +36,23 @@ app = Flask(
     __name__
 )
 
-init_database()
+
 # ============================================================
 # SECURITY / SESSION
 # ============================================================
 
-app.secret_key = (
-    SECRET_KEY
-)
+app.secret_key = SECRET_KEY
 
 
 app.config.update(
 
     SESSION_COOKIE_HTTPONLY=True,
 
-    SESSION_COOKIE_SAMESITE="Lax"
+    SESSION_COOKIE_SAMESITE="Lax",
+
+    # Render uses HTTPS.
+    # Keep False locally because localhost is normally HTTP.
+    SESSION_COOKIE_SECURE=not DEBUG
 
 )
 
@@ -122,12 +123,34 @@ def health():
 
 
 # ============================================================
+# SERVICE STATE
+# ============================================================
+
+services_started = False
+
+
+# ============================================================
 # START BACKEND SERVICES
 # ============================================================
 
 def start_services():
 
+    global services_started
+
+
+    # Prevent accidental duplicate startup
+    # inside the same process.
+
+    if services_started:
+
+        return
+
+
+    services_started = True
+
+
     print()
+
     print(
         "======================================"
     )
@@ -142,15 +165,25 @@ def start_services():
 
 
     # --------------------------------------------------------
-    # Database
+    # PostgreSQL / Supabase
     # --------------------------------------------------------
+
+    print(
+        "Initializing PostgreSQL..."
+    )
+
 
     init_database()
 
 
     # --------------------------------------------------------
-    # Binance
+    # Binance market service
     # --------------------------------------------------------
+
+    print(
+        "Starting Binance market service..."
+    )
+
 
     market.start()
 
@@ -158,6 +191,11 @@ def start_services():
     # --------------------------------------------------------
     # Trading settlement engine
     # --------------------------------------------------------
+
+    print(
+        "Starting trading settlement engine..."
+    )
+
 
     trading.start()
 
@@ -179,15 +217,49 @@ def start_services():
 
 def stop_services():
 
+    global services_started
+
+
+    if not services_started:
+
+        return
+
+
     print(
         "Stopping backend services..."
     )
 
 
-    trading.stop()
+    try:
 
-    market.stop()
+        trading.stop()
 
+    except Exception as error:
+
+        print(
+            "Trading service stop error:",
+            error
+        )
+
+
+    try:
+
+        market.stop()
+
+    except Exception as error:
+
+        print(
+            "Market service stop error:",
+            error
+        )
+
+
+    services_started = False
+
+
+# ============================================================
+# REGISTER SHUTDOWN
+# ============================================================
 
 atexit.register(
     stop_services
@@ -195,13 +267,26 @@ atexit.register(
 
 
 # ============================================================
-# RUN
+# IMPORTANT
+#
+# Gunicorn imports:
+#
+#     app:app
+#
+# Therefore services MUST start during module initialization,
+# not only inside:
+#
+#     if __name__ == "__main__"
+# ============================================================
+
+start_services()
+
+
+# ============================================================
+# LOCAL DEVELOPMENT
 # ============================================================
 
 if __name__ == "__main__":
-
-    start_services()
-
 
     app.run(
 
@@ -210,9 +295,6 @@ if __name__ == "__main__":
         port=PORT,
 
         debug=DEBUG,
-
-        # Important because Flask debug reloader
-        # would otherwise start our Binance service twice.
 
         use_reloader=False,
 
