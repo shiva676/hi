@@ -6,947 +6,269 @@ from collections import deque
 import requests
 import websocket
 
-from config import (
-    SYMBOL,
-    CANDLE_INTERVAL,
-    HISTORY_LIMIT,
-    BINANCE_REST_URL,
-    BINANCE_WS_URL
-)
+from config import SYMBOL, CANDLE_INTERVAL, HISTORY_LIMIT, BINANCE_REST_URL, BINANCE_WS_URL
 
-
-# ============================================================
-# MARKET SERVICE
-# ============================================================
 
 class MarketService:
+    """Live Binance market feed with an automatic REST fallback.
+
+    Binance WebSocket is the primary feed.  A small watchdog refreshes the
+    latest 1m candle through REST whenever the socket is stale, which keeps the
+    Render deployment usable even when an outbound WebSocket is interrupted.
+    """
 
     def __init__(self):
-
-        # ----------------------------------------------------
-        # Market state
-        # ----------------------------------------------------
-
         self.current_price = None
-
         self.current_price_time = None
-
         self.current_candle = None
-
         self.candles = []
-
-
-        # ----------------------------------------------------
-        # Recent trades
-        #
-        # Stores:
-        #
-        # {
-        #     "price": 118250.50,
-        #     "time": 1785315337250
-        # }
-        #
-        # Needed later for accurate settlement.
-        # ----------------------------------------------------
-
-        self.recent_trades = deque(
-            maxlen=10000
-        )
-
-
-        # ----------------------------------------------------
-        # Thread safety
-        # ----------------------------------------------------
+        self.recent_trades = deque(maxlen=10000)
 
         self.lock = threading.RLock()
-
-
-        # ----------------------------------------------------
-        # WebSocket state
-        # ----------------------------------------------------
-
-        self.ws = None
-
-        self.worker_thread = None
-
-        self.running = False
-
-        self.connected = False
-
-
-        # ----------------------------------------------------
-        # Event listeners
-        #
-        # Other parts of our backend can subscribe to
-        # realtime market updates.
-        # ----------------------------------------------------
-
         self.listeners = []
+        self.ws = None
+        self.worker_thread = None
+        self.fallback_thread = None
+        self.running = False
+        self.socket_connected = False
+        self.last_update_monotonic = 0.0
+        self.http = requests.Session()
 
-
-    # ========================================================
-    # LOAD HISTORICAL CANDLES
-    # ========================================================
+    def _format_candle(self, row):
+        return {
+            "time": int(int(row[0]) / 1000),
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+        }
 
     def load_history(self):
-
-        print(
-            f"Loading {SYMBOL} market history..."
-        )
-
+        print(f"Loading {SYMBOL} market history...", flush=True)
         try:
-
-            response = requests.get(
+            response = self.http.get(
                 BINANCE_REST_URL,
-                params={
-                    "symbol": SYMBOL,
-                    "interval": CANDLE_INTERVAL,
-                    "limit": HISTORY_LIMIT
-                },
-                timeout=10
+                params={"symbol": SYMBOL, "interval": CANDLE_INTERVAL, "limit": HISTORY_LIMIT},
+                timeout=8,
             )
-
             response.raise_for_status()
-
-            raw_candles = response.json()
-
-
-            formatted = []
-
-
-            for candle in raw_candles:
-
-                formatted.append({
-
-                    # Binance gives milliseconds.
-                    # Lightweight Charts uses seconds.
-                    "time":
-                        int(candle[0] / 1000),
-
-                    "open":
-                        float(candle[1]),
-
-                    "high":
-                        float(candle[2]),
-
-                    "low":
-                        float(candle[3]),
-
-                    "close":
-                        float(candle[4])
-
-                })
-
-
+            formatted = [self._format_candle(row) for row in response.json()]
             if not formatted:
+                raise RuntimeError("Binance returned no candles")
 
-                raise RuntimeError(
-                    "Binance returned no candles."
-                )
-
-
+            now_ms = int(time.time() * 1000)
             with self.lock:
+                self.candles = formatted[-HISTORY_LIMIT:]
+                self.current_candle = formatted[-1].copy()
+                self.current_price = float(self.current_candle["close"])
+                self.current_price_time = now_ms
+                self.last_update_monotonic = time.monotonic()
+                self.recent_trades.append({"price": self.current_price, "time": now_ms})
 
-                self.candles = formatted
-
-
-                # Latest Binance REST candle is normally
-                # the currently active candle.
-
-                self.current_candle = (
-                    formatted[-1].copy()
-                )
-
-
-                self.current_price = float(
-                    self.current_candle["close"]
-                )
-
-
-            print(
-                f"Loaded {len(formatted)} candles."
-            )
-
-            print(
-                f"Initial price: {self.current_price}"
-            )
-
-
+            print(f"Loaded {len(formatted)} candles. Initial price: {self.current_price}", flush=True)
             return True
-
-
         except Exception as error:
-
-            print(
-                "Failed to load market history:",
-                error
-            )
-
+            print("Failed to load market history:", repr(error), flush=True)
             return False
 
-
-    # ========================================================
-    # PROCESS REAL BINANCE TRADE
-    # ========================================================
-
-    def process_trade(
-        self,
-        price,
-        trade_time_ms
-    ):
-
-        price = float(price)
-
-        trade_time_ms = int(
-            trade_time_ms
-        )
-
-
-        # Binance timestamp:
-        #
-        # 1785315337250 milliseconds
-        #
-        # Convert to seconds for chart.
-
-        timestamp_seconds = (
-            trade_time_ms // 1000
-        )
-
-
-        # Beginning of the corresponding minute.
-        #
-        # Example:
-        #
-        # 14:32:47
-        #
-        # becomes:
-        #
-        # 14:32:00
-
-        minute_timestamp = (
-            timestamp_seconds // 60
-        ) * 60
-
+    def _apply_candle(self, candle, price_time_ms=None):
+        now_ms = int(price_time_ms or time.time() * 1000)
+        candle = {
+            "time": int(candle["time"]),
+            "open": float(candle["open"]),
+            "high": float(candle["high"]),
+            "low": float(candle["low"]),
+            "close": float(candle["close"]),
+        }
 
         with self.lock:
-
-            # ------------------------------------------------
-            # Store authoritative latest price
-            # ------------------------------------------------
-
-            self.current_price = price
-
-            self.current_price_time = (
-                trade_time_ms
-            )
-
-
-            # ------------------------------------------------
-            # Save timestamped Binance trade
-            # ------------------------------------------------
-
-            self.recent_trades.append({
-
-                "price": price,
-
-                "time": trade_time_ms
-
-            })
-
-
-            # ------------------------------------------------
-            # No candle yet
-            # ------------------------------------------------
-
-            if self.current_candle is None:
-
-                self.current_candle = {
-
-                    "time":
-                        minute_timestamp,
-
-                    "open":
-                        price,
-
-                    "high":
-                        price,
-
-                    "low":
-                        price,
-
-                    "close":
-                        price
-
-                }
-
-
-            # ------------------------------------------------
-            # SAME MINUTE
-            # ------------------------------------------------
-
-            elif (
-                self.current_candle["time"]
-                == minute_timestamp
-            ):
-
-                self.current_candle["high"] = max(
-
-                    self.current_candle["high"],
-
-                    price
-
-                )
-
-
-                self.current_candle["low"] = min(
-
-                    self.current_candle["low"],
-
-                    price
-
-                )
-
-
-                self.current_candle["close"] = (
-                    price
-                )
-
-
-            # ------------------------------------------------
-            # NEW MINUTE
-            # ------------------------------------------------
-
-            elif (
-                minute_timestamp >
-                self.current_candle["time"]
-            ):
-
-                previous_candle = (
-                    self.current_candle.copy()
-                )
-
-
-                # --------------------------------------------
-                # Store completed previous candle
-                # --------------------------------------------
-
-                if self.candles:
-
-                    if (
-                        self.candles[-1]["time"]
-                        == previous_candle["time"]
-                    ):
-
-                        self.candles[-1] = (
-                            previous_candle
-                        )
-
-                    else:
-
-                        self.candles.append(
-                            previous_candle
-                        )
-
-                else:
-
-                    self.candles.append(
-                        previous_candle
-                    )
-
-
-                # Keep memory controlled.
-
-                self.candles = (
-                    self.candles[-500:]
-                )
-
-
-                # --------------------------------------------
-                # Start new candle
-                # --------------------------------------------
-
-                self.current_candle = {
-
-                    "time":
-                        minute_timestamp,
-
-                    "open":
-                        price,
-
-                    "high":
-                        price,
-
-                    "low":
-                        price,
-
-                    "close":
-                        price
-
-                }
-
-
-            # ------------------------------------------------
-            # Ignore an old/out-of-order trade for candle
-            #
-            # We still keep it in recent_trades.
-            # ------------------------------------------------
-
-            else:
-
-                return
-
-
-            market_event = {
-
-                "type":
-                    "market",
-
-                "symbol":
-                    SYMBOL,
-
-                "price":
-                    self.current_price,
-
-                "price_time":
-                    self.current_price_time,
-
-                "candle":
-                    self.current_candle.copy()
-
+            if self.candles and self.candles[-1]["time"] == candle["time"]:
+                self.candles[-1] = candle.copy()
+            elif not self.candles or candle["time"] > self.candles[-1]["time"]:
+                self.candles.append(candle.copy())
+                self.candles = self.candles[-500:]
+
+            self.current_candle = candle.copy()
+            self.current_price = candle["close"]
+            self.current_price_time = now_ms
+            self.last_update_monotonic = time.monotonic()
+            self.recent_trades.append({"price": self.current_price, "time": now_ms})
+            event = {
+                "type": "market",
+                "symbol": SYMBOL,
+                "price": self.current_price,
+                "price_time": self.current_price_time,
+                "candle": self.current_candle.copy(),
             }
 
+        self._notify_listeners(event)
 
-        # ----------------------------------------------------
-        # Notify listeners OUTSIDE lock
-        # ----------------------------------------------------
+    def process_trade(self, price, trade_time_ms):
+        price = float(price)
+        trade_time_ms = int(trade_time_ms)
+        minute = (trade_time_ms // 1000 // 60) * 60
 
-        self._notify_listeners(
-            market_event
-        )
+        with self.lock:
+            current = self.current_candle.copy() if self.current_candle else None
 
+        if current is None or minute > current["time"]:
+            candle = {"time": minute, "open": price, "high": price, "low": price, "close": price}
+        elif minute == current["time"]:
+            candle = {
+                "time": minute,
+                "open": current["open"],
+                "high": max(current["high"], price),
+                "low": min(current["low"], price),
+                "close": price,
+            }
+        else:
+            # Old trade: keep it for settlement but do not move the chart back.
+            with self.lock:
+                self.recent_trades.append({"price": price, "time": trade_time_ms})
+            return
 
-    # ========================================================
-    # BINANCE MESSAGE
-    # ========================================================
+        self._apply_candle(candle, trade_time_ms)
 
-    def _on_message(
-        self,
-        ws,
-        message
-    ):
+    def _on_open(self, ws):
+        with self.lock:
+            self.socket_connected = True
+        print("Binance WebSocket connected.", flush=True)
 
+    def _on_message(self, ws, message):
         try:
-
-            data = json.loads(
-                message
-            )
-
-
-            # Binance trade stream:
-            #
-            # p = price
-            # T = trade time
-
-            price = float(
-                data["p"]
-            )
-
-
-            trade_time = int(
-                data["T"]
-            )
-
-
-            self.process_trade(
-                price,
-                trade_time
-            )
-
-
+            data = json.loads(message)
+            self.process_trade(float(data["p"]), int(data["T"]))
         except Exception as error:
+            print("Market message error:", repr(error), flush=True)
 
-            print(
-                "Market message error:",
-                error
-            )
+    def _on_error(self, ws, error):
+        print("Binance WebSocket error:", repr(error), flush=True)
 
-
-    # ========================================================
-    # BINANCE CONNECTED
-    # ========================================================
-
-    def _on_open(
-        self,
-        ws
-    ):
-
+    def _on_close(self, ws, code, message):
         with self.lock:
-            self.connected = True
-
-        print(
-            "Binance WebSocket connected.",
-            flush=True
-        )
-
-
-    # ========================================================
-    # BINANCE ERROR
-    # ========================================================
-
-    def _on_error(
-        self,
-        ws,
-        error
-    ):
-
-        print(
-            "Binance WebSocket error:",
-            error
-        )
-
-
-    # ========================================================
-    # BINANCE CLOSED
-    # ========================================================
-
-    def _on_close(
-        self,
-        ws,
-        close_status_code,
-        close_message
-    ):
-
-        with self.lock:
-            self.connected = False
-
-        print(
-            "Binance WebSocket disconnected.",
-            "Code:",
-            close_status_code,
-            "Message:",
-            close_message,
-            flush=True
-        )
-
-
-    # ========================================================
-    # BINANCE WORKER
-    # ========================================================
+            self.socket_connected = False
+        print("Binance WebSocket disconnected:", code, message, flush=True)
 
     def _websocket_worker(self):
-
         while self.running:
-
             try:
-
-                print(
-                    "Connecting to Binance WebSocket:",
-                    BINANCE_WS_URL,
-                    flush=True
-                )
-
                 self.ws = websocket.WebSocketApp(
                     BINANCE_WS_URL,
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
-                    on_close=self._on_close
+                    on_close=self._on_close,
                 )
-
-                print(
-                    "Calling WebSocket run_forever()...",
-                    flush=True
-                )
-
-                self.ws.run_forever(
-                    ping_interval=20,
-                    ping_timeout=10
-                )
-
-                print(
-                    "WebSocket run_forever() returned.",
-                    flush=True
-                )
-
+                self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as error:
-
-                with self.lock:
-                    self.connected = False
-
-                print(
-                    "WebSocket worker exception:",
-                    repr(error),
-                    flush=True
-                )
-
+                print("Market WebSocket worker error:", repr(error), flush=True)
+            with self.lock:
+                self.socket_connected = False
             if self.running:
+                time.sleep(2)
 
-                print(
-                    "Reconnecting Binance in 3 seconds...",
-                    flush=True
-                )
-
-                time.sleep(3)
-
-
-    # ========================================================
-    # START MARKET SERVICE
-    # ========================================================
-
-    def start(
-        self
-    ):
-
-        if self.running:
-
+    def _refresh_latest_candle_rest(self):
+        response = self.http.get(
+            BINANCE_REST_URL,
+            params={"symbol": SYMBOL, "interval": CANDLE_INTERVAL, "limit": 2},
+            timeout=6,
+        )
+        response.raise_for_status()
+        rows = response.json()
+        if not rows:
             return
+        self._apply_candle(self._format_candle(rows[-1]), int(time.time() * 1000))
 
-
-        # ----------------------------------------------------
-        # Load historical candles first
-        # ----------------------------------------------------
-
-        history_loaded = (
-            self.load_history()
-        )
-
-
-        if not history_loaded:
-
-            print(
-                "Warning: starting WebSocket "
-                "without historical candles."
-            )
-
-
-        self.running = True
-
-
-        self.worker_thread = threading.Thread(
-
-            target=
-                self._websocket_worker,
-
-            daemon=True,
-
-            name="BinanceMarketThread"
-
-        )
-
-
-        self.worker_thread.start()
-
-
-        print(
-            "Market service started."
-        )
-
-
-    # ========================================================
-    # STOP MARKET SERVICE
-    # ========================================================
-
-    def stop(
-        self
-    ):
-
-        self.running = False
-
-
-        if self.ws:
-
+    def _fallback_worker(self):
+        while self.running:
             try:
-
-                self.ws.close()
-
-            except Exception:
-
-                pass
-
-
-        print(
-            "Market service stopped."
-        )
-
-
-    # ========================================================
-    # GET CURRENT PRICE
-    # ========================================================
-
-    def get_current_price(
-        self
-    ):
-
-        with self.lock:
-
-            return self.current_price
-
-
-    # ========================================================
-    # GET CURRENT PRICE + BINANCE TIMESTAMP
-    # ========================================================
-
-    def get_current_market_state(
-        self
-    ):
-
-        with self.lock:
-
-            return {
-
-                "price":
-                    self.current_price,
-
-                "price_time":
-                    self.current_price_time,
-
-                "connected":
-                    self.connected
-
-            }
-
-
-    # ========================================================
-    # GET CURRENT CANDLE
-    # ========================================================
-
-    def get_current_candle(
-        self
-    ):
-
-        with self.lock:
-
-            if (
-                self.current_candle
-                is None
-            ):
-
-                return None
-
-
-            return (
-                self.current_candle.copy()
-            )
-
-
-    # ========================================================
-    # GET CHART HISTORY
-    # ========================================================
-
-    def get_candles(
-        self
-    ):
-
-        with self.lock:
-
-            result = [
-
-                candle.copy()
-
-                for candle
-                in self.candles
-
-            ]
-
-
-            # Make sure latest active candle
-            # appears correctly.
-
-            if self.current_candle:
-
-                if (
-                    result and
-
-                    result[-1]["time"]
-                    ==
-                    self.current_candle["time"]
-                ):
-
-                    result[-1] = (
-                        self.current_candle.copy()
-                    )
-
+                with self.lock:
+                    age = time.monotonic() - self.last_update_monotonic if self.last_update_monotonic else 999
+                # REST also acts as a periodic watchdog.  During a healthy WS
+                # connection it is intentionally infrequent.
+                if age > 3:
+                    self._refresh_latest_candle_rest()
+                    time.sleep(1)
                 else:
+                    time.sleep(2)
+            except Exception as error:
+                print("Market REST fallback error:", repr(error), flush=True)
+                time.sleep(2)
 
-                    result.append(
-                        self.current_candle.copy()
-                    )
+    def start(self):
+        if self.running:
+            return
+        self.load_history()
+        self.running = True
+        self.worker_thread = threading.Thread(target=self._websocket_worker, daemon=True, name="BinanceMarketThread")
+        self.fallback_thread = threading.Thread(target=self._fallback_worker, daemon=True, name="BinanceRestFallbackThread")
+        self.worker_thread.start()
+        self.fallback_thread.start()
+        print("Market service started.", flush=True)
 
-
-            return result
-
-
-    # ========================================================
-    # FIND EXPIRY PRICE
-    # ========================================================
-
-    def get_first_trade_at_or_after(
-        self,
-        timestamp_ms
-    ):
-
-        """
-
-        Finds the first Binance trade whose
-        Binance trade timestamp is >= timestamp_ms.
-
-        Example:
-
-        expiry:
-            14:33:17.250
-
-        Binance trades:
-
-            14:33:17.238   $100
-            14:33:17.271   $101
-
-        Returns:
-
-            $101 @ 14:33:17.271
-
-        """
-
-        timestamp_ms = int(
-            timestamp_ms
-        )
-
-
-        with self.lock:
-
-            for trade in self.recent_trades:
-
-                if (
-                    trade["time"]
-                    >= timestamp_ms
-                ):
-
-                    return (
-                        trade.copy()
-                    )
-
-
-        return None
-
-
-    # ========================================================
-    # ADD EVENT LISTENER
-    # ========================================================
-
-    def add_listener(
-        self,
-        callback
-    ):
-
-        if callback not in self.listeners:
-
-            self.listeners.append(
-                callback
-            )
-
-
-    # ========================================================
-    # REMOVE EVENT LISTENER
-    # ========================================================
-
-    def remove_listener(
-        self,
-        callback
-    ):
-
+    def stop(self):
+        self.running = False
         try:
-
-            self.listeners.remove(
-                callback
-            )
-
-        except ValueError:
-
+            if self.ws:
+                self.ws.close()
+        except Exception:
             pass
 
+    def get_candles(self):
+        with self.lock:
+            candles = [c.copy() for c in self.candles]
+            current = self.current_candle.copy() if self.current_candle else None
+        if current:
+            if candles and candles[-1]["time"] == current["time"]:
+                candles[-1] = current
+            elif not candles or current["time"] > candles[-1]["time"]:
+                candles.append(current)
+        return candles[-HISTORY_LIMIT:]
 
-    # ========================================================
-    # NOTIFY EVENT LISTENERS
-    # ========================================================
+    def get_current_candle(self):
+        with self.lock:
+            return self.current_candle.copy() if self.current_candle else None
 
-    def _notify_listeners(
-        self,
-        event
-    ):
+    def get_current_market_state(self):
+        with self.lock:
+            age = time.monotonic() - self.last_update_monotonic if self.last_update_monotonic else 999
+            # A fresh REST fallback is valid live market data too; do not mark
+            # the whole app unavailable merely because the Binance WS dropped.
+            connected = self.current_price is not None and age < 10
+            return {
+                "symbol": SYMBOL,
+                "price": self.current_price,
+                "price_time": self.current_price_time,
+                "connected": connected,
+                "socket_connected": self.socket_connected,
+            }
 
-        for callback in list(
-            self.listeners
-        ):
+    def get_first_trade_at_or_after(self, timestamp_ms):
+        timestamp_ms = int(timestamp_ms)
+        with self.lock:
+            for trade in self.recent_trades:
+                if int(trade["time"]) >= timestamp_ms:
+                    return dict(trade)
+            # REST fallback updates are also stored in recent_trades, so an
+            # expired trade can settle even after a socket interruption.
+        return None
 
+    def add_listener(self, callback):
+        if callback not in self.listeners:
+            self.listeners.append(callback)
+
+    def remove_listener(self, callback):
+        try:
+            self.listeners.remove(callback)
+        except ValueError:
+            pass
+
+    def _notify_listeners(self, event):
+        for callback in list(self.listeners):
             try:
-
-                callback(
-                    event
-                )
-
+                callback(event)
             except Exception as error:
+                print("Market listener error:", repr(error), flush=True)
 
-                print(
-                    "Market listener error:",
-                    error
-                )
-
-
-# ============================================================
-# GLOBAL MARKET INSTANCE
-# ============================================================
 
 market = MarketService()
-
-
-# ============================================================
-# DIRECT TEST
-# ============================================================
-
-if __name__ == "__main__":
-
-    market.start()
-
-
-    print()
-    print(
-        "Watching BTCUSDT..."
-    )
-
-    print(
-        "Press CTRL+C to stop."
-    )
-    print()
-
-
-    try:
-
-        while True:
-
-            state = (
-                market.get_current_market_state()
-            )
-
-
-            print(
-
-                "Price:",
-
-                state["price"],
-
-                "| Binance time:",
-
-                state["price_time"],
-
-                "| Connected:",
-
-                state["connected"]
-
-            )
-
-
-            time.sleep(2)
-
-
-    except KeyboardInterrupt:
-
-        market.stop()
