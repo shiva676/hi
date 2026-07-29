@@ -480,10 +480,12 @@ class MarketService:
         ws
     ):
 
-        self.connected = True
+        with self.lock:
+            self.connected = True
 
         print(
-            "Binance WebSocket connected."
+            "Binance WebSocket connected.",
+            flush=True
         )
 
 
@@ -514,10 +516,16 @@ class MarketService:
         close_message
     ):
 
-        self.connected = False
+        with self.lock:
+            self.connected = False
 
         print(
-            "Binance WebSocket disconnected."
+            "Binance WebSocket disconnected.",
+            "Code:",
+            close_status_code,
+            "Message:",
+            close_message,
+            flush=True
         )
 
 
@@ -527,59 +535,58 @@ class MarketService:
 
     def _websocket_worker(self):
 
-    while self.running:
+        while self.running:
 
-        try:
+            try:
 
-            print(
-                "Connecting to Binance WebSocket:",
-                BINANCE_WS_URL,
-                flush=True
-            )
+                print(
+                    "Connecting to Binance WebSocket:",
+                    BINANCE_WS_URL,
+                    flush=True
+                )
 
-            self.ws = websocket.WebSocketApp(
+                self.ws = websocket.WebSocketApp(
+                    BINANCE_WS_URL,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close
+                )
 
-                BINANCE_WS_URL,
+                print(
+                    "Calling WebSocket run_forever()...",
+                    flush=True
+                )
 
-                on_open=self._on_open,
-                on_message=self._on_message,
-                on_error=self._on_error,
-                on_close=self._on_close
+                self.ws.run_forever(
+                    ping_interval=20,
+                    ping_timeout=10
+                )
 
-            )
+                print(
+                    "WebSocket run_forever() returned.",
+                    flush=True
+                )
 
-            print(
-                "Calling WebSocket run_forever()...",
-                flush=True
-            )
+            except Exception as error:
 
-            self.ws.run_forever(
-                ping_interval=20,
-                ping_timeout=10
-            )
+                with self.lock:
+                    self.connected = False
 
-            print(
-                "WebSocket run_forever() returned.",
-                flush=True
-            )
+                print(
+                    "WebSocket worker exception:",
+                    repr(error),
+                    flush=True
+                )
 
-        except Exception as error:
+            if self.running:
 
-            print(
-                "WebSocket worker exception:",
-                repr(error),
-                flush=True
-            )
+                print(
+                    "Reconnecting Binance in 3 seconds...",
+                    flush=True
+                )
 
-
-        if self.running:
-
-            print(
-                "Reconnecting Binance in 3 seconds...",
-                flush=True
-            )
-
-            time.sleep(3)
+                time.sleep(3)
 
 
     # ========================================================
