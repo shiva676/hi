@@ -26,6 +26,10 @@ from routes.websocket import (
 
 from services.market import market
 from services.trading import trading
+from services.multi_trade import install_multi_trade_support
+
+# Enable multiple simultaneous positions before API requests are handled.
+install_multi_trade_support(trading)
 
 
 # ============================================================
@@ -43,17 +47,10 @@ app = Flask(
 
 app.secret_key = SECRET_KEY
 
-
 app.config.update(
-
     SESSION_COOKIE_HTTPONLY=True,
-
     SESSION_COOKIE_SAMESITE="Lax",
-
-    # Render uses HTTPS.
-    # Keep False locally because localhost is normally HTTP.
     SESSION_COOKIE_SECURE=not DEBUG
-
 )
 
 
@@ -61,23 +58,15 @@ app.config.update(
 # WEBSOCKET
 # ============================================================
 
-sock = Sock(
-    app
-)
-
-
-register_websocket(
-    sock
-)
+sock = Sock(app)
+register_websocket(sock)
 
 
 # ============================================================
 # API ROUTES
 # ============================================================
 
-app.register_blueprint(
-    api
-)
+app.register_blueprint(api)
 
 
 # ============================================================
@@ -86,10 +75,7 @@ app.register_blueprint(
 
 @app.route("/")
 def index():
-
-    return render_template(
-        "index.html"
-    )
+    return render_template("index.html")
 
 
 # ============================================================
@@ -98,27 +84,11 @@ def index():
 
 @app.route("/health")
 def health():
-
-    market_state = (
-        market.get_current_market_state()
-    )
-
-
+    market_state = market.get_current_market_state()
     return {
-
-        "status":
-            "ok",
-
-        "market_connected":
-            market_state[
-                "connected"
-            ],
-
-        "market_price":
-            market_state[
-                "price"
-            ]
-
+        "status": "ok",
+        "market_connected": market_state["connected"],
+        "market_price": market_state["price"]
     }
 
 
@@ -134,80 +104,29 @@ services_started = False
 # ============================================================
 
 def start_services():
-
     global services_started
 
-
-    # Prevent accidental duplicate startup
-    # inside the same process.
-
     if services_started:
-
         return
-
 
     services_started = True
 
-
     print()
+    print("======================================")
+    print(" Trading Prototype")
+    print("======================================")
 
-    print(
-        "======================================"
-    )
-
-    print(
-        " Trading Prototype"
-    )
-
-    print(
-        "======================================"
-    )
-
-
-    # --------------------------------------------------------
-    # PostgreSQL / Supabase
-    # --------------------------------------------------------
-
-    print(
-        "Initializing PostgreSQL..."
-    )
-
-
+    print("Initializing PostgreSQL...")
     init_database()
 
-
-    # --------------------------------------------------------
-    # Binance market service
-    # --------------------------------------------------------
-
-    print(
-        "Starting Binance market service..."
-    )
-
-
+    print("Starting Binance market service...")
     market.start()
 
-
-    # --------------------------------------------------------
-    # Trading settlement engine
-    # --------------------------------------------------------
-
-    print(
-        "Starting trading settlement engine..."
-    )
-
-
+    print("Starting trading settlement engine...")
     trading.start()
 
-
-    print(
-        "Backend services started."
-    )
-
-    print(
-        "======================================"
-    )
-
+    print("Backend services started.")
+    print("======================================")
     print()
 
 
@@ -216,88 +135,37 @@ def start_services():
 # ============================================================
 
 def stop_services():
-
     global services_started
 
-
     if not services_started:
-
         return
 
-
-    print(
-        "Stopping backend services..."
-    )
-
+    print("Stopping backend services...")
 
     try:
-
         trading.stop()
-
     except Exception as error:
-
-        print(
-            "Trading service stop error:",
-            error
-        )
-
+        print("Trading service stop error:", error)
 
     try:
-
         market.stop()
-
     except Exception as error:
-
-        print(
-            "Market service stop error:",
-            error
-        )
-
+        print("Market service stop error:", error)
 
     services_started = False
 
 
-# ============================================================
-# REGISTER SHUTDOWN
-# ============================================================
+atexit.register(stop_services)
 
-atexit.register(
-    stop_services
-)
-
-
-# ============================================================
-# IMPORTANT
-#
-# Gunicorn imports:
-#
-#     app:app
-#
-# Therefore services MUST start during module initialization,
-# not only inside:
-#
-#     if __name__ == "__main__"
-# ============================================================
-
+# Gunicorn imports app:app, so services must start on module import.
 start_services()
 
 
-# ============================================================
-# LOCAL DEVELOPMENT
-# ============================================================
-
 if __name__ == "__main__":
-
     app.run(
-
         host=HOST,
-
         port=PORT,
-
         debug=DEBUG,
-
         use_reloader=False,
-
         threaded=True
-
     )
