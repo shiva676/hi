@@ -6,7 +6,7 @@ from flask import (
 )
 
 from flask_sock import Sock
-
+from database.db import init_database
 from config import (
     DEBUG,
     HOST,
@@ -37,7 +37,7 @@ app = Flask(
     __name__
 )
 
-
+init_database()
 # ============================================================
 # SECURITY / SESSION
 # ============================================================
