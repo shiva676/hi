@@ -1,1387 +1,262 @@
-import psycopg
-from psycopg.rows import dict_row
 import threading
 import time
 from datetime import datetime, timezone
 
-from config import (
-    DATABASE_URL,
-    TRADE_DURATION_SECONDS,
-    DEMO_PAYOUT,
-    MIN_TRADE_AMOUNT,
-    MAX_TRADE_AMOUNT
-)
+import psycopg
+from psycopg.rows import dict_row
 
+from config import DATABASE_URL, TRADE_DURATION_SECONDS, DEMO_PAYOUT, MIN_TRADE_AMOUNT, MAX_TRADE_AMOUNT
 from services.market import market
 
 
-# ============================================================
-# TRADING SERVICE
-# ============================================================
-
 class TradingService:
-
     def __init__(self):
-
         self.running = False
-
         self.worker_thread = None
-
-        # Prevent two threads from modifying
-        # balances/trades simultaneously.
         self.lock = threading.RLock()
-
-        # Event listeners will later allow
-        # websocket.py to push trade results
-        # to connected users.
         self.listeners = []
 
-
-    # ========================================================
-    # DATABASE CONNECTION
-    # ========================================================
-
     def _get_connection(self):
-
         if not DATABASE_URL:
-
-            raise RuntimeError(
-                "DATABASE_URL is not configured."
-            )
-
-
-        return psycopg.connect(
-            DATABASE_URL,
-            row_factory=dict_row,
-            connect_timeout=10
-        )
-
-
-    # ========================================================
-    # CURRENT UTC TIME
-    # ========================================================
+            raise RuntimeError("DATABASE_URL is not configured.")
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
 
     def _utc_now(self):
+        return datetime.now(timezone.utc).isoformat()
 
-        return datetime.now(
-            timezone.utc
-        ).isoformat()
-
-
-    # ========================================================
-    # OPEN TRADE
-    # ========================================================
-
-    def open_trade(
-        self,
-        user_id,
-        direction,
-        amount
-    ):
-
-        """
-        Creates a new demo trade.
-
-        IMPORTANT:
-
-        Frontend does NOT provide:
-
-        - entry price
-        - expiry time
-        - result
-        - balance
-        - payout
-
-        Backend determines all of them.
-        """
-
-        # ----------------------------------------------------
-        # Validate direction
-        # ----------------------------------------------------
-
-        direction = str(
-            direction
-        ).upper().strip()
-
-
-        if direction not in (
-            "UP",
-            "DOWN"
-        ):
-
-            return {
-                "success": False,
-                "error": "Invalid direction."
-            }
-
-
-        # ----------------------------------------------------
-        # Validate amount
-        # ----------------------------------------------------
-
+    def open_trade(self, user_id, direction, amount):
+        direction = str(direction).upper().strip()
+        if direction not in ("UP", "DOWN"):
+            return {"success": False, "error": "Invalid direction."}
         try:
-
-            amount = float(
-                amount
-            )
-
-        except (
-            TypeError,
-            ValueError
-        ):
-
-            return {
-                "success": False,
-                "error": "Invalid trade amount."
-            }
-
-
+            amount = float(amount)
+        except (TypeError, ValueError):
+            return {"success": False, "error": "Invalid trade amount."}
         if amount < MIN_TRADE_AMOUNT:
-
-            return {
-                "success": False,
-                "error":
-                    f"Minimum trade amount is "
-                    f"${MIN_TRADE_AMOUNT:.2f}."
-            }
-
-
+            return {"success": False, "error": f"Minimum trade amount is ${MIN_TRADE_AMOUNT:.2f}."}
         if amount > MAX_TRADE_AMOUNT:
+            return {"success": False, "error": f"Maximum trade amount is ${MAX_TRADE_AMOUNT:.2f}."}
 
-            return {
-                "success": False,
-                "error":
-                    f"Maximum trade amount is "
-                    f"${MAX_TRADE_AMOUNT:.2f}."
-            }
+        state = market.get_current_market_state()
+        if state.get("price") is None:
+            return {"success": False, "error": "Market price is unavailable."}
+        if not state.get("connected"):
+            return {"success": False, "error": "Live market data is reconnecting. Try again in a moment."}
+        if state.get("price_time") is None:
+            return {"success": False, "error": "Waiting for live market data."}
 
+        entry_price = float(state["price"])
+        entry_time = int(state["price_time"])
+        expiry_time = entry_time + TRADE_DURATION_SECONDS * 1000
+        created_at = self._utc_now()
 
-        # ----------------------------------------------------
-        # Get authoritative market state
-        # ----------------------------------------------------
-
-        market_state = (
-            market.get_current_market_state()
-        )
-
-
-        entry_price = (
-            market_state["price"]
-        )
-
-
-        entry_market_time = (
-            market_state["price_time"]
-        )
-
-
-        if entry_price is None:
-
-            return {
-                "success": False,
-                "error":
-                    "Market price is unavailable."
-            }
-
-
-        if not market_state["connected"]:
-
-            return {
-                "success": False,
-                "error":
-                    "Market connection is unavailable."
-            }
-
-
-        # ----------------------------------------------------
-        # Use Binance's latest trade timestamp
-        #
-        # This keeps our expiry timeline tied to
-        # authoritative market data.
-        # ----------------------------------------------------
-
-        if entry_market_time is None:
-
-            return {
-                "success": False,
-                "error":
-                    "Waiting for live market data."
-            }
-
-
-        entry_time = int(
-            entry_market_time
-        )
-
-
-        expiry_time = (
-
-            entry_time +
-
-            (
-                TRADE_DURATION_SECONDS
-                * 1000
-            )
-
-        )
-
-
-        created_at = (
-            self._utc_now()
-        )
-
-
-        # ----------------------------------------------------
-        # Database transaction
-        # ----------------------------------------------------
-
+        # Multiple positions are intentionally allowed. FOR UPDATE makes rapid
+        # clicks safe by serializing deductions from the same user's balance.
         with self.lock:
-
-            connection = (
-                self._get_connection()
-            )
-
-
+            connection = self._get_connection()
             try:
-
-                # IMMEDIATE prevents another write transaction
-                # from modifying the same balance concurrently.
-
-                cursor = (
-                    connection.cursor()
-                )
-
-
-                # --------------------------------------------
-                # Load user
-                # --------------------------------------------
-
-                cursor.execute(
-                    """
-                    SELECT
-                        id,
-                        demo_balance
-
-                    FROM users
-
-                    WHERE id = %s
-
-                    FOR UPDATE
-                    """,
-                    (
-                        user_id,
-                    )
-                )
-
-
-                user = (
-                    cursor.fetchone()
-                )
-
-
-                if user is None:
-
+                cursor = connection.cursor()
+                cursor.execute("SELECT id, demo_balance FROM users WHERE id = %s FOR UPDATE", (user_id,))
+                user = cursor.fetchone()
+                if not user:
                     connection.rollback()
-
-                    return {
-                        "success": False,
-                        "error":
-                            "User not found."
-                    }
-
-
-                balance = float(
-                    user["demo_balance"]
-                )
-
-
-                # --------------------------------------------
-                # Check balance
-                # --------------------------------------------
-
+                    return {"success": False, "error": "User not found."}
+                balance = float(user["demo_balance"])
                 if balance < amount:
-
                     connection.rollback()
+                    return {"success": False, "error": "Insufficient demo balance."}
 
-                    return {
-                        "success": False,
-                        "error":
-                            "Insufficient demo balance."
-                    }
-
-
-                # --------------------------------------------
-                # Prototype rule:
-                #
-                # ONE open trade per user.
-                # --------------------------------------------
-
+                new_balance = balance - amount
                 cursor.execute(
-                    """
-                    SELECT id
-
-                    FROM demo_trades
-
-                    WHERE
-                        user_id = %s
-                        AND status = 'OPEN'
-
-                    LIMIT 1
-                    """,
-                    (
-                        user_id,
-                    )
+                    "UPDATE users SET demo_balance = %s, updated_at = %s WHERE id = %s",
+                    (new_balance, created_at, user_id),
                 )
-
-
-                existing_trade = (
-                    cursor.fetchone()
-                )
-
-
-                if existing_trade:
-
-                    connection.rollback()
-
-                    return {
-                        "success": False,
-                        "error":
-                            "You already have an open trade."
-                    }
-
-
-                # --------------------------------------------
-                # Deduct stake
-                # --------------------------------------------
-
-                new_balance = (
-                    balance - amount
-                )
-
-
                 cursor.execute(
-                    """
-                    UPDATE users
-
-                    SET
-                        demo_balance = %s,
-                        updated_at = %s
-
-                    WHERE id = %s
-                    """,
-                    (
-                        new_balance,
-                        created_at,
-                        user_id
-                    )
+                    """INSERT INTO demo_trades
+                       (user_id, direction, amount, entry_price, exit_price, entry_time,
+                        expiry_time, status, result, profit, created_at)
+                       VALUES (%s,%s,%s,%s,NULL,%s,%s,'OPEN',NULL,0,%s)
+                       RETURNING id""",
+                    (user_id, direction, amount, entry_price, entry_time, expiry_time, created_at),
                 )
-
-
-                # --------------------------------------------
-                # Create trade
-                # --------------------------------------------
-
-                cursor.execute(
-                    """
-                    INSERT INTO demo_trades
-                    (
-                        user_id,
-                        direction,
-                        amount,
-                        entry_price,
-                        exit_price,
-                        entry_time,
-                        expiry_time,
-                        status,
-                        result,
-                        profit,
-                        created_at
-                    )
-
-                    VALUES
-                    (
-                        %s, %s, %s, %s,
-                        NULL,
-                        %s, %s,
-                        'OPEN',
-                        NULL,
-                        0,
-                        %s
-                    )
-
-                    RETURNING id
-                    """,
-                    (
-                        user_id,
-                        direction,
-                        amount,
-                        float(entry_price),
-                        entry_time,
-                        expiry_time,
-                        created_at
-                    )
-                )
-
-
-                trade_id = (
-                    cursor.fetchone()["id"]
-                )
-
-
+                trade_id = cursor.fetchone()["id"]
                 connection.commit()
-
-
             except Exception as error:
-
                 connection.rollback()
-
-                print(
-                    "Open trade database error:",
-                    error
-                )
-
-                return {
-                    "success": False,
-                    "error":
-                        "Unable to create trade."
-                }
-
-
+                print("Open trade database error:", repr(error), flush=True)
+                return {"success": False, "error": "Unable to create trade."}
             finally:
-
                 connection.close()
-
-
-        # ----------------------------------------------------
-        # Trade successfully opened
-        # ----------------------------------------------------
 
         trade = {
-
-            "id":
-                trade_id,
-
-            "user_id":
-                user_id,
-
-            "direction":
-                direction,
-
-            "amount":
-                amount,
-
-            "entry_price":
-                float(entry_price),
-
-            "entry_time":
-                entry_time,
-
-            "expiry_time":
-                expiry_time,
-
-            "duration":
-                TRADE_DURATION_SECONDS,
-
-            "status":
-                "OPEN",
-
-            "balance":
-                new_balance
-
+            "id": trade_id, "user_id": user_id, "direction": direction, "amount": amount,
+            "entry_price": entry_price, "entry_time": entry_time, "expiry_time": expiry_time,
+            "duration": TRADE_DURATION_SECONDS, "status": "OPEN", "balance": new_balance,
         }
+        self._notify_listeners({"type": "trade_opened", "user_id": user_id, "trade": trade})
+        return {"success": True, "trade": trade}
 
-
-        self._notify_listeners({
-
-            "type":
-                "trade_opened",
-
-            "user_id":
-                user_id,
-
-            "trade":
-                trade
-
-        })
-
-
-        return {
-            "success": True,
-            "trade": trade
-        }
-
-
-    # ========================================================
-    # GET OPEN TRADE
-    # ========================================================
-
-    def get_open_trade(
-        self,
-        user_id
-    ):
-
-        connection = (
-            self._get_connection()
-        )
-
-        cursor = (
-            connection.cursor()
-        )
-
-
-        cursor.execute(
-            """
-            SELECT *
-
-            FROM demo_trades
-
-            WHERE
-                user_id = %s
-                AND status = 'OPEN'
-
-            ORDER BY id DESC
-
-            LIMIT 1
-            """,
-            (
-                user_id,
-            )
-        )
-
-
-        row = (
-            cursor.fetchone()
-        )
-
-
-        connection.close()
-
-
-        if row is None:
-
-            return None
-
-
-        return dict(
-            row
-        )
-
-
-    # ========================================================
-    # GET TRADE
-    # ========================================================
-
-    def get_trade(
-        self,
-        trade_id
-    ):
-
-        connection = (
-            self._get_connection()
-        )
-
-        cursor = (
-            connection.cursor()
-        )
-
-
-        cursor.execute(
-            """
-            SELECT *
-
-            FROM demo_trades
-
-            WHERE id = %s
-            """,
-            (
-                trade_id,
-            )
-        )
-
-
-        row = (
-            cursor.fetchone()
-        )
-
-
-        connection.close()
-
-
-        if row is None:
-
-            return None
-
-
-        return dict(
-            row
-        )
-
-
-    # ========================================================
-    # GET USER TRADE HISTORY
-    # ========================================================
-
-    def get_trade_history(
-        self,
-        user_id,
-        limit=20
-    ):
-
+    def get_open_trades(self, user_id):
+        connection = self._get_connection()
         try:
-
-            limit = int(
-                limit
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT * FROM demo_trades WHERE user_id = %s AND status = 'OPEN' ORDER BY expiry_time ASC, id ASC",
+                (user_id,),
             )
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            connection.close()
 
-        except (
-            TypeError,
-            ValueError
-        ):
+    def get_open_trade(self, user_id):
+        trades = self.get_open_trades(user_id)
+        return trades[0] if trades else None
 
+    def get_trade(self, trade_id):
+        connection = self._get_connection()
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SELECT * FROM demo_trades WHERE id = %s", (trade_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            connection.close()
+
+    def get_trade_history(self, user_id, limit=20):
+        try:
+            limit = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
             limit = 20
+        connection = self._get_connection()
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SELECT * FROM demo_trades WHERE user_id = %s ORDER BY id DESC LIMIT %s", (user_id, limit))
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            connection.close()
 
-
-        limit = max(
-            1,
-            min(
-                limit,
-                100
-            )
-        )
-
-
-        connection = (
-            self._get_connection()
-        )
-
-        cursor = (
-            connection.cursor()
-        )
-
-
-        cursor.execute(
-            """
-            SELECT *
-
-            FROM demo_trades
-
-            WHERE user_id = %s
-
-            ORDER BY id DESC
-
-            LIMIT %s
-            """,
-            (
-                user_id,
-                limit
-            )
-        )
-
-
-        rows = (
-            cursor.fetchall()
-        )
-
-
-        connection.close()
-
-
-        return [
-            dict(row)
-            for row in rows
-        ]
-
-
-    # ========================================================
-    # DETERMINE RESULT
-    # ========================================================
-
-    def _determine_result(
-        self,
-        direction,
-        entry_price,
-        exit_price
-    ):
-
-        entry_price = float(
-            entry_price
-        )
-
-        exit_price = float(
-            exit_price
-        )
-
-
-        # ----------------------------------------------------
-        # Exact same price
-        # ----------------------------------------------------
-
+    def _determine_result(self, direction, entry_price, exit_price):
+        entry_price, exit_price = float(entry_price), float(exit_price)
         if exit_price == entry_price:
-
             return "DRAW"
-
-
-        # ----------------------------------------------------
-        # UP
-        # ----------------------------------------------------
-
         if direction == "UP":
+            return "WIN" if exit_price > entry_price else "LOSS"
+        return "WIN" if exit_price < entry_price else "LOSS"
 
-            if exit_price > entry_price:
-
-                return "WIN"
-
-            return "LOSS"
-
-
-        # ----------------------------------------------------
-        # DOWN
-        # ----------------------------------------------------
-
-        if direction == "DOWN":
-
-            if exit_price < entry_price:
-
-                return "WIN"
-
-            return "LOSS"
-
-
-        raise ValueError(
-            "Unknown trade direction."
-        )
-
-
-    # ========================================================
-    # SETTLE ONE TRADE
-    # ========================================================
-
-    def settle_trade(
-        self,
-        trade_id
-    ):
-
-        """
-        Settlement rule:
-
-        Exit price = first Binance trade whose
-        Binance trade timestamp is >= expiry_time.
-        """
-
+    def settle_trade(self, trade_id):
         with self.lock:
-
-            # ------------------------------------------------
-            # Load trade
-            # ------------------------------------------------
-
-            trade = (
-                self.get_trade(
-                    trade_id
-                )
-            )
-
-
-            if trade is None:
-
-                return {
-                    "success": False,
-                    "error":
-                        "Trade not found."
-                }
-
-
+            trade = self.get_trade(trade_id)
+            if not trade:
+                return {"success": False, "error": "Trade not found."}
             if trade["status"] != "OPEN":
+                return {"success": True, "already_settled": True, "trade": trade}
 
-                return {
-                    "success": True,
-                    "already_settled": True,
-                    "trade": trade
-                }
+            expiry_time = int(trade["expiry_time"])
+            tick = market.get_first_trade_at_or_after(expiry_time)
+            if tick is None:
+                return {"success": False, "waiting_for_market": True}
 
-
-            expiry_time = int(
-                trade["expiry_time"]
-            )
-
-
-            # ------------------------------------------------
-            # Ask market.py for FIRST Binance
-            # trade at or after expiry.
-            # ------------------------------------------------
-
-            expiry_market_trade = (
-
-                market
-                .get_first_trade_at_or_after(
-                    expiry_time
-                )
-
-            )
-
-
-            # No Binance trade after expiry yet.
-            #
-            # Do NOT guess.
-            # Worker will try again shortly.
-
-            if expiry_market_trade is None:
-
-                return {
-                    "success": False,
-                    "waiting_for_market": True
-                }
-
-
-            exit_price = float(
-                expiry_market_trade["price"]
-            )
-
-
-            settlement_market_time = int(
-                expiry_market_trade["time"]
-            )
-
-
-            entry_price = float(
-                trade["entry_price"]
-            )
-
-
-            direction = (
-                trade["direction"]
-            )
-
-
-            amount = float(
-                trade["amount"]
-            )
-
-
-            result = (
-                self._determine_result(
-                    direction,
-                    entry_price,
-                    exit_price
-                )
-            )
-
-
-            # ------------------------------------------------
-            # Calculate payout
-            # ------------------------------------------------
-
+            exit_price = float(tick["price"])
+            entry_price = float(trade["entry_price"])
+            amount = float(trade["amount"])
+            result = self._determine_result(trade["direction"], entry_price, exit_price)
             if result == "WIN":
-
-                profit = (
-                    amount
-                    * DEMO_PAYOUT
-                )
-
-                amount_to_credit = (
-                    amount
-                    + profit
-                )
-
-
+                profit = amount * DEMO_PAYOUT
+                credit = amount + profit
             elif result == "DRAW":
-
                 profit = 0.0
-
-                # Return stake.
-
-                amount_to_credit = (
-                    amount
-                )
-
-
+                credit = amount
             else:
+                profit = -amount
+                credit = 0.0
 
-                # Stake was already deducted
-                # when trade opened.
-
-                profit = (
-                    -amount
-                )
-
-                amount_to_credit = 0.0
-
-
-            settled_at = (
-                self._utc_now()
-            )
-
-
-            connection = (
-                self._get_connection()
-            )
-
-
+            connection = self._get_connection()
             try:
-
-                cursor = (
-                    connection.cursor()
-                )
-
-
-                # --------------------------------------------
-                # Re-check trade while holding DB write lock
-                # --------------------------------------------
-
-                cursor.execute(
-                    """
-                    SELECT status
-
-                    FROM demo_trades
-
-                    WHERE id = %s
-
-                    FOR UPDATE
-                    """,
-                    (
-                        trade_id,
-                    )
-                )
-
-
-                status_row = (
-                    cursor.fetchone()
-                )
-
-
-                if status_row is None:
-
+                cursor = connection.cursor()
+                cursor.execute("SELECT status FROM demo_trades WHERE id = %s FOR UPDATE", (trade_id,))
+                row = cursor.fetchone()
+                if not row or row["status"] != "OPEN":
                     connection.rollback()
+                    return {"success": True, "already_settled": True}
 
-                    return {
-                        "success": False,
-                        "error":
-                            "Trade disappeared."
-                    }
-
-
-                if (
-                    status_row["status"]
-                    != "OPEN"
-                ):
-
-                    connection.rollback()
-
-                    return {
-                        "success": True,
-                        "already_settled": True
-                    }
-
-
-                # --------------------------------------------
-                # Credit winnings/refund
-                # --------------------------------------------
-
-                if amount_to_credit > 0:
-
+                if credit > 0:
                     cursor.execute(
-                        """
-                        UPDATE users
-
-                        SET
-                            demo_balance =
-                                demo_balance + %s,
-
-                            updated_at = %s
-
-                        WHERE id = %s
-                        """,
-                        (
-                            amount_to_credit,
-                            settled_at,
-                            trade["user_id"]
-                        )
+                        "UPDATE users SET demo_balance = demo_balance + %s, updated_at = %s WHERE id = %s",
+                        (credit, self._utc_now(), trade["user_id"]),
                     )
-
-
-                # --------------------------------------------
-                # Close trade
-                # --------------------------------------------
-
                 cursor.execute(
-                    """
-                    UPDATE demo_trades
-
-                    SET
-                        exit_price = %s,
-                        status = 'CLOSED',
-                        result = %s,
-                        profit = %s
-
-                    WHERE
-                        id = %s
-                        AND status = 'OPEN'
-                    """,
-                    (
-                        exit_price,
-                        result,
-                        profit,
-                        trade_id
-                    )
+                    "UPDATE demo_trades SET exit_price=%s,status='CLOSED',result=%s,profit=%s WHERE id=%s AND status='OPEN'",
+                    (exit_price, result, profit, trade_id),
                 )
-
-
-                # --------------------------------------------
-                # Get final balance
-                # --------------------------------------------
-
-                cursor.execute(
-                    """
-                    SELECT demo_balance
-
-                    FROM users
-
-                    WHERE id = %s
-                    """,
-                    (
-                        trade["user_id"],
-                    )
-                )
-
-
-                balance_row = (
-                    cursor.fetchone()
-                )
-
-
-                final_balance = float(
-                    balance_row["demo_balance"]
-                )
-
-
+                cursor.execute("SELECT demo_balance FROM users WHERE id=%s", (trade["user_id"],))
+                final_balance = float(cursor.fetchone()["demo_balance"])
                 connection.commit()
-
-
             except Exception as error:
-
                 connection.rollback()
-
-                print(
-                    "Settlement database error:",
-                    error
-                )
-
-                return {
-                    "success": False,
-                    "error":
-                        "Settlement failed."
-                }
-
-
+                print("Settlement database error:", repr(error), flush=True)
+                return {"success": False, "error": "Settlement failed."}
             finally:
-
                 connection.close()
 
-
-        # ----------------------------------------------------
-        # Build result
-        # ----------------------------------------------------
-
-        settled_trade = {
-
-            "id":
-                trade_id,
-
-            "user_id":
-                trade["user_id"],
-
-            "direction":
-                direction,
-
-            "amount":
-                amount,
-
-            "entry_price":
-                entry_price,
-
-            "exit_price":
-                exit_price,
-
-            "entry_time":
-                trade["entry_time"],
-
-            "expiry_time":
-                expiry_time,
-
-            "settlement_market_time":
-                settlement_market_time,
-
-            "status":
-                "CLOSED",
-
-            "result":
-                result,
-
-            "profit":
-                profit,
-
-            "balance":
-                final_balance
-
+        settled = {
+            **trade, "exit_price": exit_price, "status": "CLOSED", "result": result,
+            "profit": profit, "balance": final_balance, "settlement_market_time": int(tick["time"]),
         }
+        self._notify_listeners({"type": "trade_settled", "user_id": trade["user_id"], "trade": settled})
+        return {"success": True, "trade": settled}
 
-
-        print(
-            f"Trade #{trade_id} settled:",
-            result,
-            "| Entry:",
-            entry_price,
-            "| Exit:",
-            exit_price
-        )
-
-
-        # Later websocket.py will listen for this.
-
-        self._notify_listeners({
-
-            "type":
-                "trade_settled",
-
-            "user_id":
-                trade["user_id"],
-
-            "trade":
-                settled_trade
-
-        })
-
-
-        return {
-            "success": True,
-            "trade": settled_trade
-        }
-
-
-    # ========================================================
-    # GET ALL EXPIRED OPEN TRADES
-    # ========================================================
-
-    def _get_expired_trades(
-        self
-    ):
-
-        # ----------------------------------------------------
-        # IMPORTANT
-        #
-        # We compare against latest Binance market timestamp,
-        # not browser Date.now().
-        # ----------------------------------------------------
-
-        market_state = (
-            market.get_current_market_state()
-        )
-
-
-        market_time = (
-            market_state["price_time"]
-        )
-
-
+    def _get_expired_trades(self):
+        state = market.get_current_market_state()
+        market_time = state.get("price_time")
         if market_time is None:
-
             return []
-
-
-        connection = (
-            self._get_connection()
-        )
-
-        cursor = (
-            connection.cursor()
-        )
-
-
-        cursor.execute(
-            """
-            SELECT id
-
-            FROM demo_trades
-
-            WHERE
-                status = 'OPEN'
-                AND expiry_time <= %s
-
-            ORDER BY expiry_time ASC
-            """,
-            (
-                int(market_time),
+        connection = self._get_connection()
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT id FROM demo_trades WHERE status='OPEN' AND expiry_time <= %s ORDER BY expiry_time ASC",
+                (int(market_time),),
             )
-        )
+            return [row["id"] for row in cursor.fetchall()]
+        finally:
+            connection.close()
 
-
-        rows = (
-            cursor.fetchall()
-        )
-
-
-        connection.close()
-
-
-        return [
-            row["id"]
-            for row in rows
-        ]
-
-
-    # ========================================================
-    # SETTLEMENT WORKER
-    # ========================================================
-
-    def _settlement_worker(
-        self
-    ):
-
-        print(
-            "Trade settlement engine started."
-        )
-
-
+    def _settlement_worker(self):
+        print("Trade settlement engine started.", flush=True)
         while self.running:
-
             try:
-
-                expired_trade_ids = (
-                    self._get_expired_trades()
-                )
-
-
-                for trade_id in (
-                    expired_trade_ids
-                ):
-
-                    self.settle_trade(
-                        trade_id
-                    )
-
-
+                for trade_id in self._get_expired_trades():
+                    self.settle_trade(trade_id)
             except Exception as error:
+                print("Settlement worker error:", repr(error), flush=True)
+            time.sleep(0.25)
 
-                print(
-                    "Settlement worker error:",
-                    error
-                )
-
-
-            # This is NOT the trade timer.
-            #
-            # Expiry remains the exact stored
-            # millisecond timestamp.
-            #
-            # This only controls how often we look
-            # for newly expired trades.
-
-            time.sleep(
-                0.10
-            )
-
-
-    # ========================================================
-    # START TRADING ENGINE
-    # ========================================================
-
-    def start(
-        self
-    ):
-
+    def start(self):
         if self.running:
-
             return
-
-
         self.running = True
-
-
-        self.worker_thread = (
-            threading.Thread(
-
-                target=
-                    self._settlement_worker,
-
-                daemon=True,
-
-                name=
-                    "TradeSettlementThread"
-
-            )
-        )
-
-
+        self.worker_thread = threading.Thread(target=self._settlement_worker, daemon=True, name="TradeSettlementThread")
         self.worker_thread.start()
 
-
-    # ========================================================
-    # STOP TRADING ENGINE
-    # ========================================================
-
-    def stop(
-        self
-    ):
-
+    def stop(self):
         self.running = False
 
-
-    # ========================================================
-    # EVENT LISTENERS
-    # ========================================================
-
-    def add_listener(
-        self,
-        callback
-    ):
-
+    def add_listener(self, callback):
         if callback not in self.listeners:
+            self.listeners.append(callback)
 
-            self.listeners.append(
-                callback
-            )
-
-
-    def remove_listener(
-        self,
-        callback
-    ):
-
+    def remove_listener(self, callback):
         try:
-
-            self.listeners.remove(
-                callback
-            )
-
+            self.listeners.remove(callback)
         except ValueError:
-
             pass
 
-
-    def _notify_listeners(
-        self,
-        event
-    ):
-
-        for callback in list(
-            self.listeners
-        ):
-
+    def _notify_listeners(self, event):
+        for callback in list(self.listeners):
             try:
-
-                callback(
-                    event
-                )
-
+                callback(event)
             except Exception as error:
+                print("Trading listener error:", repr(error), flush=True)
 
-                print(
-                    "Trading listener error:",
-                    error
-                )
-
-
-# ============================================================
-# GLOBAL TRADING INSTANCE
-# ============================================================
 
 trading = TradingService()
