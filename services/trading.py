@@ -1,10 +1,11 @@
-import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 import threading
 import time
 from datetime import datetime, timezone
 
 from config import (
-    DATABASE_PATH,
+    DATABASE_URL,
     TRADE_DURATION_SECONDS,
     DEMO_PAYOUT,
     MIN_TRADE_AMOUNT,
@@ -42,14 +43,18 @@ class TradingService:
 
     def _get_connection(self):
 
-        connection = sqlite3.connect(
-            DATABASE_PATH,
-            timeout=10
+        if not DATABASE_URL:
+
+            raise RuntimeError(
+                "DATABASE_URL is not configured."
+            )
+
+
+        return psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+            connect_timeout=10
         )
-
-        connection.row_factory = sqlite3.Row
-
-        return connection
 
 
     # ========================================================
@@ -242,11 +247,6 @@ class TradingService:
                 # IMMEDIATE prevents another write transaction
                 # from modifying the same balance concurrently.
 
-                connection.execute(
-                    "BEGIN IMMEDIATE"
-                )
-
-
                 cursor = (
                     connection.cursor()
                 )
@@ -264,7 +264,9 @@ class TradingService:
 
                     FROM users
 
-                    WHERE id = ?
+                    WHERE id = %s
+
+                    FOR UPDATE
                     """,
                     (
                         user_id,
@@ -321,7 +323,7 @@ class TradingService:
                     FROM demo_trades
 
                     WHERE
-                        user_id = ?
+                        user_id = %s
                         AND status = 'OPEN'
 
                     LIMIT 1
@@ -362,10 +364,10 @@ class TradingService:
                     UPDATE users
 
                     SET
-                        demo_balance = ?,
-                        updated_at = ?
+                        demo_balance = %s,
+                        updated_at = %s
 
-                    WHERE id = ?
+                    WHERE id = %s
                     """,
                     (
                         new_balance,
@@ -398,14 +400,16 @@ class TradingService:
 
                     VALUES
                     (
-                        ?, ?, ?, ?,
+                        %s, %s, %s, %s,
                         NULL,
-                        ?, ?,
+                        %s, %s,
                         'OPEN',
                         NULL,
                         0,
-                        ?
+                        %s
                     )
+
+                    RETURNING id
                     """,
                     (
                         user_id,
@@ -420,7 +424,7 @@ class TradingService:
 
 
                 trade_id = (
-                    cursor.lastrowid
+                    cursor.fetchone()["id"]
                 )
 
 
@@ -532,7 +536,7 @@ class TradingService:
             FROM demo_trades
 
             WHERE
-                user_id = ?
+                user_id = %s
                 AND status = 'OPEN'
 
             ORDER BY id DESC
@@ -587,7 +591,7 @@ class TradingService:
 
             FROM demo_trades
 
-            WHERE id = ?
+            WHERE id = %s
             """,
             (
                 trade_id,
@@ -661,11 +665,11 @@ class TradingService:
 
             FROM demo_trades
 
-            WHERE user_id = ?
+            WHERE user_id = %s
 
             ORDER BY id DESC
 
-            LIMIT ?
+            LIMIT %s
             """,
             (
                 user_id,
@@ -914,11 +918,6 @@ class TradingService:
 
             try:
 
-                connection.execute(
-                    "BEGIN IMMEDIATE"
-                )
-
-
                 cursor = (
                     connection.cursor()
                 )
@@ -934,7 +933,9 @@ class TradingService:
 
                     FROM demo_trades
 
-                    WHERE id = ?
+                    WHERE id = %s
+
+                    FOR UPDATE
                     """,
                     (
                         trade_id,
@@ -983,11 +984,11 @@ class TradingService:
 
                         SET
                             demo_balance =
-                                demo_balance + ?,
+                                demo_balance + %s,
 
-                            updated_at = ?
+                            updated_at = %s
 
-                        WHERE id = ?
+                        WHERE id = %s
                         """,
                         (
                             amount_to_credit,
@@ -1006,13 +1007,13 @@ class TradingService:
                     UPDATE demo_trades
 
                     SET
-                        exit_price = ?,
+                        exit_price = %s,
                         status = 'CLOSED',
-                        result = ?,
-                        profit = ?
+                        result = %s,
+                        profit = %s
 
                     WHERE
-                        id = ?
+                        id = %s
                         AND status = 'OPEN'
                     """,
                     (
@@ -1034,7 +1035,7 @@ class TradingService:
 
                     FROM users
 
-                    WHERE id = ?
+                    WHERE id = %s
                     """,
                     (
                         trade["user_id"],
@@ -1203,7 +1204,7 @@ class TradingService:
 
             WHERE
                 status = 'OPEN'
-                AND expiry_time <= ?
+                AND expiry_time <= %s
 
             ORDER BY expiry_time ASC
             """,
