@@ -2,7 +2,7 @@ import atexit
 
 from flask import Flask, render_template
 
-from config import DEBUG, HOST, PORT, SECRET_KEY
+from config import DEBUG, HOST, PORT, SECRET_KEY, MARKET_NAME, SYMBOL, CURRENCY_SYMBOL, PRICE_DECIMALS
 from database.db import init_database
 from routes.api import api
 from services.market import market
@@ -16,6 +16,16 @@ app.config.update(
     SESSION_COOKIE_SECURE=not DEBUG,
 )
 app.register_blueprint(api)
+
+
+@app.context_processor
+def inject_ui_constants():
+    return {
+        "MARKET_NAME": MARKET_NAME,
+        "SYMBOL": SYMBOL,
+        "CURRENCY_SYMBOL": CURRENCY_SYMBOL,
+        "PRICE_DECIMALS": PRICE_DECIMALS,
+    }
 
 
 @app.route("/")
@@ -32,6 +42,8 @@ def health():
         "market_socket_connected": state.get("socket_connected", False),
         "market_price": state["price"],
         "market_price_time": state.get("price_time"),
+        "market_symbol": SYMBOL,
+        "market_name": MARKET_NAME,
     }
 
 
