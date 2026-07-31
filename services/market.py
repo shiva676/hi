@@ -31,6 +31,9 @@ class MarketService:
         self.http = requests.Session()
         self.ticker_url = "https://api.binance.com/api/v3/ticker/price"
 
+    def _symbol_is_sol(self):
+        return str(SYMBOL).upper() == "SOLUSDT"
+
     def _format_candle(self, row):
         return {
             "time": int(int(row[0]) / 1000),
@@ -96,7 +99,13 @@ class MarketService:
             self.current_price_time = timestamp_ms
             self.last_update_monotonic = time.monotonic()
             self.recent_trades.append({"price": price, "time": timestamp_ms})
-            event = {"type": "market", "symbol": SYMBOL, "price": price, "price_time": timestamp_ms, "candle": candle.copy()}
+            event = {
+                "type": "market",
+                "symbol": SYMBOL,
+                "price": price,
+                "price_time": timestamp_ms,
+                "candle": candle.copy(),
+            }
         self._notify_listeners(event)
 
     def process_trade(self, price, trade_time_ms):
@@ -141,17 +150,22 @@ class MarketService:
                 time.sleep(2)
 
     def _rest_worker(self):
+        # Keep the price moving even if the websocket is temporarily idle.
         while self.running:
             try:
                 response = self.http.get(self.ticker_url, params={"symbol": SYMBOL}, timeout=5)
                 response.raise_for_status()
                 price = float(response.json()["price"])
                 self._apply_price(price, int(time.time() * 1000))
-                time.sleep(0.75)
+                time.sleep(0.5 if self._symbol_is_sol() else 0.75)
             except Exception as e:
                 print("Market REST ticker error:", repr(e), flush=True)
                 try:
-                    response = self.http.get(BINANCE_REST_URL, params={"symbol": SYMBOL, "interval": CANDLE_INTERVAL, "limit": 1}, timeout=5)
+                    response = self.http.get(
+                        BINANCE_REST_URL,
+                        params={"symbol": SYMBOL, "interval": CANDLE_INTERVAL, "limit": 1},
+                        timeout=5,
+                    )
                     response.raise_for_status()
                     row = response.json()[-1]
                     self._apply_price(float(row[4]), int(time.time() * 1000))
