@@ -6,7 +6,13 @@ from collections import deque
 import requests
 import websocket
 
-from config import SYMBOL, CANDLE_INTERVAL, HISTORY_LIMIT, BINANCE_REST_URL, BINANCE_WS_URL
+from config import (
+    SYMBOL,
+    CANDLE_INTERVAL,
+    HISTORY_LIMIT,
+    BINANCE_REST_URL,
+    BINANCE_WS_URL,
+)
 
 
 class MarketService:
@@ -26,13 +32,23 @@ class MarketService:
         self.ticker_url = "https://api.binance.com/api/v3/ticker/price"
 
     def _format_candle(self, row):
-        return {"time": int(int(row[0]) / 1000), "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4])}
+        return {
+            "time": int(int(row[0]) / 1000),
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+        }
 
     def load_history(self):
         try:
-            r = self.http.get(BINANCE_REST_URL, params={"symbol": SYMBOL, "interval": CANDLE_INTERVAL, "limit": HISTORY_LIMIT}, timeout=8)
-            r.raise_for_status()
-            candles = [self._format_candle(x) for x in r.json()]
+            response = self.http.get(
+                BINANCE_REST_URL,
+                params={"symbol": SYMBOL, "interval": CANDLE_INTERVAL, "limit": HISTORY_LIMIT},
+                timeout=8,
+            )
+            response.raise_for_status()
+            candles = [self._format_candle(x) for x in response.json()]
             if not candles:
                 return False
             with self.lock:
@@ -51,13 +67,19 @@ class MarketService:
     def _apply_price(self, price, timestamp_ms):
         price = float(price)
         timestamp_ms = int(timestamp_ms)
-        minute = (timestamp_ms // 60000) * 60
+        minute = (timestamp_ms // 1000 // 60) * 60
         with self.lock:
             current = self.current_candle.copy() if self.current_candle else None
         if current is None or minute > current["time"]:
             candle = {"time": minute, "open": price, "high": price, "low": price, "close": price}
         elif minute == current["time"]:
-            candle = {"time": minute, "open": current["open"], "high": max(current["high"], price), "low": min(current["low"], price), "close": price}
+            candle = {
+                "time": minute,
+                "open": current["open"],
+                "high": max(current["high"], price),
+                "low": min(current["low"], price),
+                "close": price,
+            }
         else:
             with self.lock:
                 self.recent_trades.append({"price": price, "time": timestamp_ms})
@@ -103,7 +125,13 @@ class MarketService:
     def _websocket_worker(self):
         while self.running:
             try:
-                self.ws = websocket.WebSocketApp(BINANCE_WS_URL, on_open=self._on_open, on_message=self._on_message, on_error=self._on_error, on_close=self._on_close)
+                self.ws = websocket.WebSocketApp(
+                    BINANCE_WS_URL,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
                 self.ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
                 print("Market WebSocket worker error:", repr(e), flush=True)
@@ -113,22 +141,19 @@ class MarketService:
                 time.sleep(2)
 
     def _rest_worker(self):
-        # Always refresh the public ticker. This is deliberately independent of
-        # WebSocket state: Render may keep a socket open while no messages arrive.
         while self.running:
             try:
-                r = self.http.get(self.ticker_url, params={"symbol": SYMBOL}, timeout=5)
-                r.raise_for_status()
-                price = float(r.json()["price"])
+                response = self.http.get(self.ticker_url, params={"symbol": SYMBOL}, timeout=5)
+                response.raise_for_status()
+                price = float(response.json()["price"])
                 self._apply_price(price, int(time.time() * 1000))
                 time.sleep(0.75)
             except Exception as e:
                 print("Market REST ticker error:", repr(e), flush=True)
-                # Klines endpoint is a second REST path in case ticker is blocked.
                 try:
-                    r = self.http.get(BINANCE_REST_URL, params={"symbol": SYMBOL, "interval": CANDLE_INTERVAL, "limit": 1}, timeout=5)
-                    r.raise_for_status()
-                    row = r.json()[-1]
+                    response = self.http.get(BINANCE_REST_URL, params={"symbol": SYMBOL, "interval": CANDLE_INTERVAL, "limit": 1}, timeout=5)
+                    response.raise_for_status()
+                    row = response.json()[-1]
                     self._apply_price(float(row[4]), int(time.time() * 1000))
                 except Exception as e2:
                     print("Market REST kline fallback error:", repr(e2), flush=True)
@@ -162,7 +187,14 @@ class MarketService:
     def get_current_market_state(self):
         with self.lock:
             age = time.monotonic() - self.last_update_monotonic if self.last_update_monotonic else 999
-            return {"symbol": SYMBOL, "price": self.current_price, "price_time": self.current_price_time, "connected": self.current_price is not None and age < 15, "socket_connected": self.socket_connected, "age_seconds": age}
+            return {
+                "symbol": SYMBOL,
+                "price": self.current_price,
+                "price_time": self.current_price_time,
+                "connected": self.current_price is not None,
+                "socket_connected": self.socket_connected,
+                "age_seconds": age,
+            }
 
     def get_first_trade_at_or_after(self, timestamp_ms):
         with self.lock:
