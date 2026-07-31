@@ -18,7 +18,7 @@ PORT = 5000
 # Set BOT_TOKEN as an environment variable in production.
 BOT_TOKEN = os.getenv(
     "BOT_TOKEN",
-    "7834721931:AAHKXSkgUIZsZoUYkmmhA_0QeDxtjWDkTnQ"
+    "7834721931:AAHKXSkgUIZsZoUYKmmhA_0QeDxtjWDkTnQ"
 )
 SECRET_KEY = os.getenv('SECRET_KEY', 'your_secret_key_here')
 
@@ -27,6 +27,9 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'your_secret_key_here')
 # =========================================================
 
 SYMBOL = "SOLUSDT"
+MARKET_NAME = "SOL / USDT"
+PRICE_DECIMALS = 3
+CURRENCY_SYMBOL = "◎"
 
 CANDLE_INTERVAL = "1m"
 
