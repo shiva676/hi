@@ -11,7 +11,7 @@ const TradeManager = {
         await this.syncServerTime();
         await this.loadOpenTrade();
         await this.loadHistory();
-        this.timer = setInterval(() => this.tick(), 500);
+        this.timer = setInterval(() => this.tick(), 250);
     },
 
     bindControls() {
@@ -132,13 +132,9 @@ const TradeManager = {
 
     tick() {
         const now = this.getServerTime();
-        const before = this.activeTrades.length;
         const pendingExpired = this.activeTrades.some(t => Number(t.expiry_time) <= now);
-        if (pendingExpired) {
-            // Settlement is server-side. Poll shortly after expiry until DB state changes.
-            this.refreshState();
-        }
-        if (before) this.renderActiveTrade();
+        if (pendingExpired) this.refreshState();
+        if (this.activeTrades.length) this.renderActiveTrade();
     },
 
     onMarketUpdate(price) {
@@ -155,20 +151,20 @@ const TradeManager = {
             return;
         }
 
-        // Existing compact panel displays the next trade to expire. All other
-        // positions remain active and settle independently in PostgreSQL.
         this.activeTrades.sort((a, b) => Number(a.expiry_time) - Number(b.expiry_time));
         const trade = this.activeTrades[0];
         panel.classList.remove("hidden");
         const remaining = Math.max(0, Number(trade.expiry_time) - this.getServerTime());
         const seconds = Math.ceil(remaining / 1000);
+        const mins = String(Math.floor(seconds / 60)).padStart(2, "0");
+        const secs = String(seconds % 60).padStart(2, "0");
 
         this.text("active-direction", trade.direction);
         this.text("active-amount", this.money(trade.amount));
         this.text("active-entry", this.formatPrice(trade.entry_price));
         this.text("active-current", this.formatPrice(TradingChart.currentPrice || trade.entry_price));
         this.text("potential-profit", "+" + this.money(Number(trade.amount) * 0.8));
-        this.text("trade-timer", `00:${String(Math.min(seconds, 59)).padStart(2, "0")}`);
+        this.text("trade-timer", `${mins}:${secs}`);
         const label = document.querySelector("#active-trade .active-label");
         if (label) label.textContent = this.activeTrades.length > 1 ? `ACTIVE TRADES: ${this.activeTrades.length}` : "ACTIVE TRADE";
         TradingChart.showTrade(trade);
@@ -193,7 +189,7 @@ const TradeManager = {
         if (!Number.isFinite(n)) return;
         this.currentBalance = n;
         const el = document.getElementById("demo-balance");
-        if (el) el.textContent = this.money(n);
+        if (el) el.textContent = this.money(n).replace("$", "◎");
     },
 
     setTradeButtonsDisabled(disabled) {
@@ -219,11 +215,11 @@ const TradeManager = {
     },
 
     money(value) {
-        return "$" + Number(value || 0).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        return "◎" + Number(value || 0).toLocaleString("en-US", {minimumFractionDigits: 3, maximumFractionDigits: 3});
     },
 
     formatPrice(value) {
-        return "$" + Number(value || 0).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+        return "◎" + Number(value || 0).toLocaleString("en-US", {minimumFractionDigits: 3, maximumFractionDigits: 3});
     },
 
     escape(value) {
