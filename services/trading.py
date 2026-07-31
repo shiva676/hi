@@ -38,20 +38,22 @@ class TradingService:
             return {"success": False, "error": f"Maximum trade amount is ${MAX_TRADE_AMOUNT:.2f}."}
 
         state = market.get_current_market_state()
-        if state.get("price") is None:
+        price = state.get("price")
+        price_time = state.get("price_time")
+        if price is None:
             return {"success": False, "error": "Market price is unavailable."}
-        if not state.get("connected"):
-            return {"success": False, "error": "Live market data is reconnecting. Try again in a moment."}
-        if state.get("price_time") is None:
+        if price_time is None:
             return {"success": False, "error": "Waiting for live market data."}
+        # Do not block trades just because the websocket is reconnecting.
+        # A fresh REST price is enough for the demo trade engine.
+        if not state.get("connected") and not state.get("socket_connected"):
+            return {"success": False, "error": "Live market data is reconnecting. Try again in a moment."}
 
-        entry_price = float(state["price"])
-        entry_time = int(state["price_time"])
-        expiry_time = entry_time + TRADE_DURATION_SECONDS * 1000
+        entry_price = float(price)
+        entry_time = int(price_time)
+        expiry_time = entry_time + int(TRADE_DURATION_SECONDS * 1000)
         created_at = self._utc_now()
 
-        # Multiple positions are intentionally allowed. FOR UPDATE makes rapid
-        # clicks safe by serializing deductions from the same user's balance.
         with self.lock:
             connection = self._get_connection()
             try:
