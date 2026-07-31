@@ -18,7 +18,7 @@ PORT = 5000
 # Set BOT_TOKEN as an environment variable in production.
 BOT_TOKEN = os.getenv(
     "BOT_TOKEN",
-    "7834721931:AAHKXSkgUIZsZoUYKmmhA_0QeDxtjWDkTnQ"
+    "7834721931:AAHKXSkgUIZsZoUYkmmhA_0QeDxtjWDkTnQ"
 )
 SECRET_KEY = os.getenv('SECRET_KEY', 'your_secret_key_here')
 
@@ -26,7 +26,7 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'your_secret_key_here')
 # MARKET
 # =========================================================
 
-SYMBOL = "BTCUSDT"
+SYMBOL = "SOLUSDT"
 
 CANDLE_INTERVAL = "1m"
 
@@ -40,7 +40,7 @@ BINANCE_REST_URL = (
 
 BINANCE_WS_URL = (
     "wss://stream.binance.com:9443/ws/"
-    "btcusdt@trade"
+    "solusdt@trade"
 )
 
 
